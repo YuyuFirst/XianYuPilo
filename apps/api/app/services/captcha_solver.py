@@ -655,7 +655,32 @@ async def handle_captcha_for_account(
             status_message=f"正在自动求解滑块验证（{trigger_scene}）",
         )
 
-        auto_solve_result = await try_auto_solve(account_id)
+        # XY_SOLVE_SETTLE
+        # 记录在 create_solve_record 时写入 status='retrying'，只有后续显式
+        # update_solve_record 才会离开这个状态。try_auto_solve 内部要拉起浏览器、
+        # 走多轮重试和网络请求，抛异常时原实现没有兜底，记录会永久停在
+        # retrying，前端 GET /api/captcha/solve-records?status=active 会把它
+        # 当成「正在重试」一直显示（实测一条记录卡了 12 小时）。
+        try:
+            auto_solve_result = await try_auto_solve(account_id)
+        except Exception as exc:
+            logger.error(
+                "滑块求解过程异常 accountId=%d", account_id, exc_info=True
+            )
+            await update_solve_record(
+                solve_record_id, status="fail", result="slider_fail",
+                error_message=(
+                    f"滑块求解过程异常：{type(exc).__name__}: {str(exc)[:200]}"
+                ),
+                engine="Playwright",
+            )
+            await broadcast_captcha_solve(
+                account_id, account_name,
+                status="fail", result="slider_fail",
+                reason=f"滑块求解过程异常：{type(exc).__name__}",
+                record_id=solve_record_id,
+            )
+            raise
 
         if auto_solve_result.get("solved"):
             logger.info("账号 %d 滑块自动求解成功", account_id)
@@ -664,7 +689,27 @@ async def handle_captcha_for_account(
             # 滑块求解器在 Cookie Session 已过期时会误报成功（页面跳转到登录页，
             # 没有滑块组件）。此处用 Token API 做最终验证，避免错误恢复 cookie_status=1
             # 导致后续 ws_client 校验失败。
-            cookie_valid = await _verify_cookie_via_token_api(account_id)
+            # 同理：二次验证是一次网络请求，异常时也必须结算记录
+            try:
+                cookie_valid = await _verify_cookie_via_token_api(account_id)
+            except Exception as exc:
+                logger.error(
+                    "Cookie 二次验证异常 accountId=%d", account_id, exc_info=True
+                )
+                await update_solve_record(
+                    solve_record_id, status="fail", result="slider_success",
+                    error_message=(
+                        f"Cookie 二次验证异常：{type(exc).__name__}: {str(exc)[:200]}"
+                    ),
+                    engine="Playwright",
+                )
+                await broadcast_captcha_solve(
+                    account_id, account_name,
+                    status="fail", result="slider_success",
+                    reason=f"Cookie 二次验证异常：{type(exc).__name__}",
+                    record_id=solve_record_id,
+                )
+                raise
             if not cookie_valid:
                 logger.warning(
                     "账号 %d 滑块求解器报告成功，但 Token API 验证 Cookie 仍不可用，"
