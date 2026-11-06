@@ -282,7 +282,10 @@ def parse_sync_package(package: dict) -> Optional[dict]:
                     )
                     if not should_log_sample:
                         continue
-                    logger.info(
+                    # 这些多是 IM 协议的分层封装（rawKeys 为 ['1','2','3','4']）
+                    # 和群消息元数据，属于正常噪音，实测可达 130 条/6 分钟。
+                    # 用 INFO 会把真正的业务日志淹掉，降到 DEBUG 按需开启。
+                    logger.debug(
                         "WS 消息解析失败 rawKeys=%s",
                         sorted(str(key) for key in msg_data.keys())[:30],
                     )
