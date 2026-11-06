@@ -60,6 +60,13 @@ _PAYMENT_NEGATIVE_KEYWORDS = (
     "尚未付款",
 )
 
+# 订单号只出现在付款卡片的 targetUrl 里，两种链接格式都要覆盖
+_ORDER_ID_PATTERNS = (
+    re.compile(r"orderId=(\d{8,25})"),
+    re.compile(r"order_detail\?id=(\d{8,25})"),
+)
+
+
 
 def extract_order_id_from_url(url: str) -> Optional[str]:
     """Extract a non-empty order identifier from a reminder URL."""
@@ -72,6 +79,34 @@ def extract_order_id_from_url(url: str) -> Optional[str]:
             normalized = str(value).strip()
             if normalized:
                 return normalized
+    return None
+
+
+def extract_order_id_from_payload(msg: dict) -> Optional[str]:
+    """Extract an order identifier from the raw push payload.
+
+    Payment card messages carry the order id only in the dxCard button
+    link, never in ``reminderUrl``:
+
+        fleamarket://order_detail?id=5127583646141011727&role=Seller
+        https://h5.m.goofish.com/...?orderId=5127583646141011727
+
+    Returning ``None`` here makes the caller skip shipment confirmation,
+    so the delivery degrades to "message sent but not shipped".
+    """
+    blobs: list[str] = []
+    for key in ("raw_payload", "rawPayload", "complete_msg", "completeMsg"):
+        value = msg.get(key)
+        if not value:
+            continue
+        blobs.append(
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        )
+    for blob in blobs:
+        for pattern in _ORDER_ID_PATTERNS:
+            match = pattern.search(blob)
+            if match:
+                return match.group(1)
     return None
 
 
@@ -234,6 +269,9 @@ async def _process_delivery(
     session_id = str(msg.get("sId") or msg.get("sid") or "").strip()
     reminder_url = str(msg.get("reminderUrl") or msg.get("reminder_url") or "")
     external_order_id = extract_order_id_from_url(reminder_url)
+    if not external_order_id:
+        # reminderUrl 不带订单号，退回推送卡片里挖，否则确认发货无法执行
+        external_order_id = extract_order_id_from_payload(msg)
     item_id = str(msg.get("xyGoodsId") or "").strip()
     if not item_id:
         item_id = extract_goods_id_from_url(reminder_url) or ""
