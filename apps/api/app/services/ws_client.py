@@ -1,3 +1,11 @@
+# --- XY_LOG_PATCH ---
+# uvicorn 只配置了自己的 logger，业务模块的 root logger 没有 handler，
+# 所有 logger.info 会走 logging.lastResort 被丢弃，只留下 WARNING 以上。
+# 结果是 WS 注册、同步、收消息这些关键节点完全不可见，故障无法排查。
+import logging as _xy_logging
+_xy_logging.basicConfig(level=_xy_logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s', force=True)
+# --- XY_LOG_PATCH END ---
 """
 闲鱼 WebSocket 连接管理器。
 
@@ -47,6 +55,9 @@ logger = logging.getLogger(__name__)
 
 WS_URL = "wss://wss-goofish.dingtalk.com/"
 HEARTBEAT_INTERVAL = 15  # 心跳间隔（秒）
+SYNC_WATCH_INTERVAL = 30   # 同步链巡检间隔（秒）
+SYNC_IDLE_TIMEOUT = 300    # 超过该秒数没有同步包，视为链已断
+SYNC_MAX_REISSUE = 3       # 连续补发几次 sync 仍无响应就强制重连
 RECONNECT_DELAY = 5  # 重连延迟（秒）
 MESSAGE_TIMEOUT = 10  # 发送消息超时（秒）
 
@@ -873,13 +884,64 @@ class XianyuWebSocketClient:
             logger.info("WS 连接成功（已注册）accountId=%d", self.account_id)
 
             # 后台发送同步消息（不阻塞连接状态）
+            self._last_sync_activity = time.time()
+            self._sync_reissue_count = 0
+
             async def _bg_sync():
                 try:
                     await self._do_sync(ws)
                 except Exception as exc:
                     logger.warning("后台同步发送失败 accountId=%d errorType=%s", self.account_id, type(exc).__name__)
 
+            # XY_SYNC_GUARD
+            # 业务消息不是服务端主动推的，而是靠 sync 长轮询链自续：
+            # 收到 ackDiff 包 -> _handle_sync_package 再发下一轮 -> 循环。
+            # 链一旦断掉（长轮询超时、响应流中断、服务端静默），原实现停留在
+            # _bg_sync 的 except 里打一行日志就结束，没有任何机制会把它拉起来，
+            # 结果就是 TCP 活着、心跳正常、业务永久静默。
+            # 而心跳 ACK 每 2 秒刷新 _last_recv_time，使 _heartbeat_loop 里
+            # 「45 秒无消息就主动断开」的检测永远不成立，断链完全不可见。
+            # 这里只盯「同步包」活动：静默超时先补发一轮 sync（成本低，且能
+            # 恢复 stream 卡死），连续多次补发仍无响应才主动断开，交给外层
+            # _connect_loop 重连。
+            async def _sync_watchdog():
+                while True:
+                    await asyncio.sleep(SYNC_WATCH_INTERVAL)
+                    if not self._connected:
+                        break
+                    cur = getattr(self, "_ws", None)
+                    if cur is not None and cur is not ws:
+                        break
+                    idle = time.time() - getattr(self, "_last_sync_activity", time.time())
+                    if idle <= SYNC_IDLE_TIMEOUT:
+                        continue
+                    count = getattr(self, "_sync_reissue_count", 0) + 1
+                    self._sync_reissue_count = count
+                    if count > SYNC_MAX_REISSUE:
+                        logger.warning(
+                            "XY_SYNC 连续 %d 次补发无响应（静默 %.0f 秒），主动断开触发重连 accountId=%d",
+                            count, idle, self.account_id,
+                        )
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
+                    logger.warning(
+                        "XY_SYNC 同步链静默 %.0f 秒，第 %d 次补发 sync 请求 accountId=%d",
+                        idle, count, self.account_id,
+                    )
+                    try:
+                        await self._do_sync(ws)
+                        self._last_sync_activity = time.time()
+                    except Exception as exc:
+                        logger.warning(
+                            "XY_SYNC 补发 sync 失败 accountId=%d errorType=%s",
+                            self.account_id, type(exc).__name__,
+                        )
+
             asyncio.create_task(_bg_sync())
+            asyncio.create_task(_sync_watchdog())
 
             # Step 5: 消息接收循环 + 心跳
             await self._message_loop(ws)
@@ -1480,13 +1542,16 @@ class XianyuWebSocketClient:
             pass
         else:
             logger.warning(
-                "WS 未处理的消息类型 accountId=%d topLevelFieldCount=%d",
+                "WS 未处理的消息类型 accountId=%d payload=%s",
                 self.account_id,
-                len(data),
+                str(data)[:900],
             )
 
     async def _handle_sync_package(self, data: dict, ws: _ThreadedWebSocketAdapter):
         """处理同步包（聊天消息）。"""
+        # XY_SYNC_GUARD：同步包是链还活着的唯一证据，收到就刷新水位
+        self._last_sync_activity = time.time()
+        self._sync_reissue_count = 0
         lwp = data.get("lwp", "")
         is_ack_diff = lwp == "/r/SyncStatus/ackDiff"
 
