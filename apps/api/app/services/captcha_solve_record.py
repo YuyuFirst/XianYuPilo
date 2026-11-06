@@ -23,6 +23,12 @@ from .ws_sse import broadcaster
 
 logger = logging.getLogger(__name__)
 
+# 求解记录正常情况下靠 update_solve_record 离开 retrying。若求解进程在回写前
+# 异常退出（容器重启、浏览器崩溃、网络异常），记录会永久停在 retrying，
+# 前端按 status=active 查询时会把几小时前的记录当成「正在重试」显示。
+# 超过该时长的 retrying 记录视为僵尸，不再计入 active 查询结果。
+CAPTCHA_SOLVE_RETRYING_TTL_MINUTES = 30
+
 # 触发场景 → 事件描述映射
 TRIGGER_SCENE_DESC = {
     "ws_connect": "WS 连接触发滑块验证",
@@ -233,6 +239,12 @@ async def list_solve_records(
     if status:
         where_clauses.append("status = :status")
         params["status"] = status
+        if status == "retrying":
+            # 僵尸记录过滤，见 CAPTCHA_SOLVE_RETRYING_TTL_MINUTES 的说明
+            where_clauses.append(
+                f"COALESCE(updated_at, created_at) >= "
+                f"NOW() - INTERVAL {CAPTCHA_SOLVE_RETRYING_TTL_MINUTES} MINUTE"
+            )
     if trigger_scene:
         where_clauses.append("trigger_scene = :scene")
         params["scene"] = trigger_scene
