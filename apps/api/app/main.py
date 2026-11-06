@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 from fastapi import FastAPI, Request
@@ -43,6 +44,16 @@ from app.core.upload_security import (
 from app.migrations import assert_schema_current, get_schema_status
 
 install_log_redaction()
+# XY_LOG_SETUP
+# uvicorn 只配置自己的 logger，业务模块的 root logger 没有 handler，
+# 此时 logger.info 会走 logging.lastResort 被静默丢弃，只剩 WARNING 以上。
+# 结果是「WS 注册成功」「WS 收到 N 条消息」这类关键节点完全不可见。
+# worker 进程在 app.worker._configure_logging() 里做过同样的事，API 进程漏了。
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    force=True,
+)
 logger = logging.getLogger(__name__)
 UPLOADS_DIR = settings.uploads_path
 
