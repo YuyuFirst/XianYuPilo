@@ -1003,16 +1003,24 @@ class RealtimeDeliveryCoordinator:
         lease = await self._store.acquire(command)
         if lease.action in {"return", "in_progress"}:
             return self._outcome(lease)
-        if str(command.delivery_mode or "").strip().lower() not in {
-            "text",
-            "card",
-            "kami",
-        }:
+        delivery_mode = str(command.delivery_mode or "").strip().lower()
+        if delivery_mode not in {"text", "card", "kami"}:
+            # 原来的文案只提「API/custom 已停用」，但实际最常见的进入条件是
+            # delivery_mode=unconfigured，也就是该商品没有匹配到任何发货规则。
+            # 文案把排查方向指向"模式被下线"，容易让人去翻全局开关，
+            # 而真正要看的是「自动发货」里这个商品有没有配规则。
+            reason = (
+                "该商品未匹配到发货规则（delivery_mode=unconfigured），"
+                "请到「自动发货」为其配置付款后发货"
+                if delivery_mode == "unconfigured"
+                else f"发货模式不可用（delivery_mode={delivery_mode or '空'}），"
+                     "仅支持文本/卡密发货"
+            )
             lease = await self._store.mark_message_failed(
                 lease,
                 ExternalDeliveryResult.failed(
                     "delivery_mode_unavailable",
-                    "API/custom 发货模式已停用；仅支持文本或卡密发货",
+                    reason,
                     retry_safe=False,
                 ),
             )
